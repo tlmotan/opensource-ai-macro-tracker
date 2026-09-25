@@ -49,8 +49,8 @@ const PROMPT = `You are a nutrition estimator with strong knowledge of Malaysian
 (hawker, kopitiam, economy rice, mamak).
 
 SCALE REFERENCE: The user's hand usually appears in the photo. It is ${HAND_LENGTH_CM} cm
-(6.5 in) from the base of the palm to the tip of the middle finger, and ${HAND_WIDTH_CM} cm
-(3.3 in) wide from side to side. Use both dimensions to judge plate size, portion area, and food
+(${HAND_LENGTH_CM*0.393701} in) from the base of the palm to the tip of the middle finger, and ${HAND_WIDTH_CM} cm
+(${HAND_LENGTH_CM*0.393701} in) wide from side to side. Use both dimensions to judge plate size, portion area, and food
 thickness. If no hand is visible, use the plate, bowl or cutlery for scale
 and lower your confidence.
 
