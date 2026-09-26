@@ -24,7 +24,7 @@
  * macros (needs the Targets tab). Returned as "suggestion" and written to the Daily tab.
  */
 
-const VERSION = '1.0.0'; // must match the VERSION file; bump both for every release
+const VERSION = '1.0.1'; // must match the VERSION file; bump both for every release
 const REPO = 'tlmotan/opensource-ai-macro-tracker'; // where updates come from (forks: change this)
 
 // iCloud links for the Shortcuts, shown in Macro Logger → Show my Shortcut details.
@@ -159,6 +159,7 @@ METHOD:
 
 If the user note conflicts with the photo, trust the note.
 Keep "food" to a short description (under 8 words).
+Keep each item "name" short and plain (2–4 words, e.g. "white rice", "fried chicken thigh").
 Set confidence to "low", "medium" or "high".
 
 FOOD ID: Give "food_id" as a stable snake_case id for the dish as a whole, generic enough that the
@@ -290,10 +291,33 @@ function callGemini(models, payload, apiKey) {
 }
 
 function appendRow(m, note) {
-  const breakdown = (m.items || []).map(i => `${i.name} ~${Math.round(i.grams)}g`).join(', ');
-  const noteCell = [note, breakdown].filter(Boolean).join(' | ');
   const id = String(m.food_id || '').toLowerCase().replace(/[^a-z0-9_]/g, '');
-  addMealRow([new Date(), m.food, m.kcal, m.protein_g, m.carbs_g, m.fat_g, m.confidence, noteCell, id]);
+  addMealRow([new Date(), m.food, m.kcal, m.protein_g, m.carbs_g, m.fat_g, m.confidence,
+              formatNote(note, m.items), id]);
+}
+
+// Note cell: your note on the first line, then one bullet per component, e.g.
+//   Note: extra kuah
+//   • white rice: ~200 g, ~260 kcal
+//   • fried chicken thigh: ~120 g, ~310 kcal
+function formatNote(note, items) {
+  const lines = (items || []).map(i =>
+    `• ${String(i.name).trim()}: ~${Math.round(i.grams)} g, ~${Math.round(i.kcal)} kcal`);
+  if (note) lines.unshift(`Note: ${note}`);
+  return lines.join('\n');
+}
+
+// Turns notes saved by older versions ("extra kuah | rice ~200g, chicken ~120g") into bullets.
+// Leaves anything else (quick-log notes, text you typed yourself) exactly as it is.
+function tidyOldNote(s) {
+  s = String(s || '');
+  if (!s || s.includes('\n')) return s;
+  const parts = s.split(' | ');
+  const items = parts[parts.length - 1].split(', ').map(x => x.trim());
+  if (!items.every(x => /\s~\d+g$/.test(x))) return s;
+  const lines = items.map(x => `• ${x.replace(/\s~(\d+)g$/, ': ~$1 g')}`);
+  if (parts.length > 1) lines.unshift(`Note: ${parts.slice(0, -1).join(' | ')}`);
+  return lines.join('\n');
 }
 
 // Appends one meal, regroups the Log by day, and refreshes the Foods tab.
@@ -333,6 +357,7 @@ function rebuildLog() {
   const meals = sheet.getRange(2, 1, last - 1, LOG_COLS).getValues()
     .filter(r => r[0] instanceof Date && r[1] !== 'TOTAL')
     .sort((a, b) => a[0] - b[0]);
+  meals.forEach(r => { r[7] = tidyOldNote(r[7]); });
 
   const out = [];
   const totalRows = [];
@@ -354,6 +379,9 @@ function rebuildLog() {
 
   // Formatting: meals show date + time, TOTAL rows show just the day
   sheet.getRange(2, 1, out.length, 1).setNumberFormat('d mmm yyyy, h:mm am/pm');
+  sheet.getRange(2, 1, out.length, LOG_COLS).setVerticalAlignment('top'); // tidy next to tall notes
+  sheet.getRange(2, 8, out.length, 1).setWrap(true);                      // Note: bullets on their own lines
+  sheet.setColumnWidth(8, 320);
   totalRows.forEach(r => {
     const row = sheet.getRange(r, 1, 1, LOG_COLS);
     row.setFontWeight('bold').setBackground('#e8f0fe')
@@ -1130,30 +1158,32 @@ function usualFoods() {
                  `${median(rows.map(r => r[3]))}g protein, eaten ${rows.length}x)`);
 }
 
-// Shows the latest suggestions beside today's totals on the Daily tab (if it exists).
+// Shows the latest suggestions on the Daily tab (if it exists), all in one wrapped cell (G3):
+//   1. Grilled chicken + boiled egg
+//      ~250 kcal · 35 g protein
+//      Tops up protein without many calories
 function writeSuggestions(left, suggestions, time) {
   const daily = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Daily');
   if (!daily) return;
 
-  daily.getRange('G1:H8').clearContent().setBackground(null).setFontWeight('normal');
-  daily.getRange('G1:H1').setValues([['What to eat next', 'Why']])
-    .setFontWeight('bold').setBackground('#e8f0fe');
+  daily.getRange('G1:H8').clear(); // also removes the older multi-row layout
+  daily.getRange('G1').setValue('What to eat next').setFontWeight('bold').setBackground('#e8f0fe');
   daily.getRange('G2').setValue(
     `Left today: ${left.kcal} kcal · ${left.protein_g}g protein · ${left.carbs_g}g carbs · ${left.fat_g}g fat`
   ).setFontWeight('bold');
 
-  if (!suggestions.length) {
-    daily.getRange('G3').setValue('Targets hit for today 🎉');
-  } else {
-    daily.getRange(3, 7, suggestions.length, 2).setValues(suggestions.map((x, i) => [
-      `${i + 1}. ${x.meal} — ~${x.kcal} kcal, ${x.protein_g}g protein`, x.reason
-    ]));
-  }
-  daily.getRange('G7').setValue(`Updated ${time}`).setFontColor('#888888');
+  const text = suggestions.length
+    ? suggestions.map((x, i) =>
+        `${i + 1}. ${x.meal}\n     ~${x.kcal} kcal · ${x.protein_g} g protein\n     ${x.reason}`
+      ).join('\n\n')
+    : 'Targets hit for today 🎉';
+  daily.getRange('G3').setValue(text).setWrap(true).setVerticalAlignment('top');
+
+  daily.getRange('G4').setValue(`Updated ${time}`).setFontColor('#888888');
   const notice = updateNotice();
-  daily.getRange('G8').setValue(notice).setFontColor('#b3261e').setFontWeight(notice ? 'bold' : 'normal');
-  daily.setColumnWidth(7, 380);
-  daily.setColumnWidth(8, 280);
+  daily.getRange('G5').setValue(notice).setFontColor('#b3261e').setFontWeight(notice ? 'bold' : 'normal');
+  daily.setColumnWidth(7, 420);
+  daily.autoResizeRows(3, 1);
 }
 
 // Macro Logger → Refresh suggestions: updates the Daily tab suggestions without logging a meal.
