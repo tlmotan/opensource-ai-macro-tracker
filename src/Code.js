@@ -1,22 +1,17 @@
 /**
  * Macro Logger — Google Apps Script backend
  *
- * Setup:
- * 1. Create a Google Sheet → Extensions → Apps Script → paste this file.
- * 2. Project Settings (gear icon):
- *    - Time zone: (GMT+08:00) Kuala Lumpur
- *    - Script Properties → add:
- *        GEMINI_API_KEY  = your key from aistudio.google.com
- *        SHORTCUT_TOKEN  = any random password (the Shortcut sends this)
- * 3. Run `authorize` once from the editor and accept the permissions.
- * 4. Deploy → New deployment → Web app
- *    - Execute as: Me
- *    - Who has access: Anyone   (the token check keeps strangers out)
- *    Copy the Web app URL into your Shortcut.
- * 5. Optional one-time runs from the editor:
- *    - rebuildLog  → groups existing entries by day with TOTAL rows
- *    - setupDaily  → builds the "Daily" summary tab
- *    - setupTargets → builds the "Targets" calorie calculator + red/green TOTAL rows
+ * Setup (full guide in README.md):
+ * 1. Make a copy of the template Sheet (the code comes with it).
+ * 2. In the Sheet: Macro Logger → Set up / repair. It asks for your Gemini key, creates your
+ *    Shortcut token, walks you through deploying the web app, and shows the URL + token
+ *    for the iPhone Shortcuts.
+ * 3. Fill in the Settings tab (time zone, hand size, food you eat) and the Targets tab.
+ *
+ * Updates: the notification and Daily tab say when a new release is out. Macro Logger →
+ * Check for updates shows the new code with a Copy button and the steps to paste + redeploy.
+ * Nothing personal lives in this file — it's all in the Settings and Targets tabs and Script
+ * Properties — so pasting a new version never loses anything.
  *
  * Weight logging: POST {"type": "weight", "weight": 65.4, "token": "..."}
  * → one row per day in the "Weight" tab (created automatically on first log).
@@ -29,28 +24,128 @@
  * macros (needs the Targets tab). Returned as "suggestion" and written to the Daily tab.
  */
 
+const VERSION = '1.0.0'; // must match the VERSION file; bump both for every release
+const REPO = 'tlmotan/opensource-ai-macro-tracker'; // where updates come from (forks: change this)
+
+// iCloud links for the Shortcuts, shown in Macro Logger → Show my Shortcut details.
+// Only ever put links to the clean shareable copies here (see docs/PUBLISHING.md).
+const SHORTCUT_LINKS = [
+  ['Log Meal', ''],
+  ['Log Weight', '']
+];
+
 const SHEET_NAME = 'Log';
 const LOG_COLS = 9; // Timestamp … Note, Food ID
-const TIME_ZONE = 'Asia/Kuala_Lumpur';
-const DAY_START_HOUR = 4; // food eaten before 4 AM counts towards the previous day
+const RETRIES_PER_MODEL = 1; // keep total time under the Shortcut's timeout
+
+// ─────────────────────────────────────────────────────────────
+// Settings tab: everything personal lives here, not in the code
+// ─────────────────────────────────────────────────────────────
+
+const SETTINGS_SHEET = 'Settings';
+
+// [key, default, what it means]. Keys added in later versions appear automatically;
+// values people have already typed in are never overwritten.
+const SETTINGS = [
+  ['time_zone', 'Asia/Kuala_Lumpur',
+    'Your time zone, e.g. Asia/Singapore or Europe/London ("TZ identifier" column at en.wikipedia.org/wiki/List_of_tz_database_time_zones). After changing it, click Macro Logger → Set up / repair.'],
+  ['day_start_hour', 4,
+    'Food eaten before this hour counts towards the previous day (4 = 4 AM). After changing it, click Macro Logger → Set up / repair.'],
+  ['hand_length_cm', 18,
+    'Base of your palm to the tip of your middle finger. Measure your own: the AI uses your hand in the photo to judge portion size.'],
+  ['hand_width_cm', 8.5,
+    'Across your palm, side to side.'],
+  ['usual_food', 'Malaysian food (hawker, kopitiam, economy rice, mamak)',
+    'The kind of food you usually eat. Helps the AI recognise dishes and suggest meals.'],
+  ['about_me', 'someone living in Malaysia',
+    'A few words about you for meal suggestions, e.g. "a university student in Malaysia".'],
+  ['photo_models', 'gemini-3.6-flash, gemini-3.5-flash-lite',
+    'Gemini models for photos, tried in order (the next is used if one is busy). Only change if a model stops working.'],
+  ['suggest_models', 'gemini-3.5-flash-lite, gemini-3.6-flash',
+    'Gemini models for meal suggestions, tried in order.'],
+  ['sync_weight_to_targets', true,
+    'Copy each logged weight into Targets!B4, so your calorie targets follow your weight.']
+];
+
+let settingsCache = null; // read once per request
+
+// Settings from the Settings tab, with defaults for anything missing or blank.
+function getSettings() {
+  if (settingsCache) return settingsCache;
+  const values = {};
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SETTINGS_SHEET);
+  if (sheet && sheet.getLastRow() > 1) {
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues().forEach(([k, v]) => {
+      if (k !== '' && v !== '' && v !== null) values[String(k).trim()] = v;
+    });
+  }
+
+  const s = {};
+  SETTINGS.forEach(([key, def]) => {
+    const v = key in values ? values[key] : def;
+    if (key.endsWith('_models')) {
+      s[key] = String(v).split(',').map(x => x.trim()).filter(Boolean);
+    } else if (typeof def === 'boolean') {
+      s[key] = v === true || String(v).toUpperCase() === 'TRUE';
+    } else if (typeof def === 'number') {
+      s[key] = isNaN(Number(v)) ? def : Number(v);
+    } else {
+      s[key] = String(v).trim();
+    }
+  });
+  settingsCache = s;
+  return s;
+}
+
+// Creates the Settings tab and adds any missing keys. Never touches values already there.
+function ensureSettingsTab() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(SETTINGS_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(SETTINGS_SHEET);
+    sheet.getRange('A1:C1').setValues([['Setting', 'Your value', 'What it means']])
+      .setFontWeight('bold').setBackground('#e8f0fe');
+    sheet.setFrozenRows(1);
+    sheet.setColumnWidth(1, 180);
+    sheet.setColumnWidth(2, 340);
+    sheet.setColumnWidth(3, 560);
+  }
+
+  const have = sheet.getLastRow() > 1
+    ? sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getValues().map(r => String(r[0]).trim())
+    : [];
+  SETTINGS.filter(([key]) => !have.includes(key)).forEach(([key, def, help]) => {
+    const row = sheet.getLastRow() + 1;
+    sheet.getRange(row, 1, 1, 3).setValues([[key, def, help]]);
+    if (typeof def === 'boolean') sheet.getRange(row, 2).insertCheckboxes().setValue(def);
+  });
+
+  // Refresh the explanations (they're not user data) and the formatting
+  const rows = sheet.getLastRow() - 1;
+  const help = Object.fromEntries(SETTINGS.map(([key, , h]) => [key, h]));
+  const keys = sheet.getRange(2, 1, rows, 1).getValues();
+  sheet.getRange(2, 3, rows, 1).setValues(keys.map(([k]) => [help[k] || '']));
+  sheet.getRange(2, 1, rows, 1).setFontColor('#888888');
+  sheet.getRange(2, 2, rows, 1).setBackground('#fff8e1').setHorizontalAlignment('left'); // editable
+  sheet.getRange(2, 3, rows, 1).setFontColor('#666666').setWrap(true);
+
+  settingsCache = null;
+  return sheet;
+}
 
 // Which "food day" a timestamp belongs to, e.g. 1 AM on the 25th → the 24th.
 function foodDay(d) {
-  return Utilities.formatDate(new Date(d.getTime() - DAY_START_HOUR * 3600000), TIME_ZONE, 'yyyy-MM-dd');
+  const s = getSettings();
+  return Utilities.formatDate(new Date(d.getTime() - s.day_start_hour * 3600000), s.time_zone, 'yyyy-MM-dd');
 }
-// Tried in order; if one is overloaded (503/429), the next is used.
-const MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash-lite'];
-const RETRIES_PER_MODEL = 1; // keep total time under the Shortcut's timeout
 
-const HAND_LENGTH_CM = 16.5; // 6.5 in, base of palm to tip of middle finger
-const HAND_WIDTH_CM = 8.4;   // 3.3 in, side to side across the hand
+function buildPhotoPrompt(s) {
+  const inches = cm => Math.round(cm / 2.54 * 10) / 10;
+  return `You are a nutrition estimator with strong knowledge of ${s.usual_food}.
 
-const PROMPT = `You are a nutrition estimator with strong knowledge of Malaysian food
-(hawker, kopitiam, economy rice, mamak).
-
-SCALE REFERENCE: The user's hand usually appears in the photo. It is ${HAND_LENGTH_CM} cm
-(${HAND_LENGTH_CM*0.393701} in) from the base of the palm to the tip of the middle finger, and ${HAND_WIDTH_CM} cm
-(${HAND_LENGTH_CM*0.393701} in) wide from side to side. Use both dimensions to judge plate size, portion area, and food
+SCALE REFERENCE: The user's hand usually appears in the photo. It is ${s.hand_length_cm} cm
+(${inches(s.hand_length_cm)} in) from the base of the palm to the tip of the middle finger, and ${s.hand_width_cm} cm
+(${inches(s.hand_width_cm)} in) wide from side to side. Use both dimensions to judge plate size, portion area, and food
 thickness. If no hand is visible, use the plate, bowl or cutlery for scale
 and lower your confidence.
 
@@ -70,17 +165,19 @@ FOOD ID: Give "food_id" as a stable snake_case id for the dish as a whole, gener
 same meal eaten again gets the same id (e.g. roasted_chicken_rice, salmon_fillet_cooked,
 nasi_lemak_ayam_goreng). Ignore portion size and small variations. If the dish matches one of the
 KNOWN IDS listed below, reuse that exact id.`;
+}
 
 // Opening the /exec URL in a browser should show this — confirms the deployment works.
 function doGet(e) {
   const p = (e && e.parameter) || {};
   if (p.action === 'foods') {
-    if (p.token !== PropertiesService.getScriptProperties().getProperty('SHORTCUT_TOKEN')) {
+    const token = PropertiesService.getScriptProperties().getProperty('SHORTCUT_TOKEN');
+    if (!token || p.token !== token) {
       return json({ error: 'unauthorized' });
     }
     return json({ foods: foodList().map(f => f.label) });
   }
-  return json({ status: 'ok', message: 'Macro logger is running. Send photos via POST.' });
+  return json({ status: 'ok', version: VERSION, message: 'Macro logger is running. Send photos via POST.' });
 }
 
 function doPost(e) {
@@ -88,14 +185,15 @@ function doPost(e) {
     const body = JSON.parse(e.postData.contents);
     const props = PropertiesService.getScriptProperties();
 
-    if (body.token !== props.getProperty('SHORTCUT_TOKEN')) {
+    const token = props.getProperty('SHORTCUT_TOKEN');
+    if (!token || body.token !== token) {
       return json({ error: 'unauthorized' });
     }
 
     const note = (body.note || '').trim();
 
     if (body.type === 'weight') {
-      return json(logWeight(body.weight));
+      return json(Object.assign(logWeight(body.weight), { update: updateNotice() }));
     }
     if (body.type === 'quick') {
       return json(Object.assign(quickLog(body.food, body.servings), todayTotals()));
@@ -110,7 +208,7 @@ function doPost(e) {
     } catch (err) {
       console.warn('Suggestion failed: ' + err); // logging still succeeded
     }
-    return json(Object.assign(macros, todayTotals(), { suggestion }));
+    return json(Object.assign(macros, todayTotals(), { suggestion, update: updateNotice() }));
   } catch (err) {
     return json({ error: String(err) });
   }
@@ -120,7 +218,7 @@ function estimateMacros(imageB64, note, apiKey, knownIds) {
   const payload = {
     contents: [{
       parts: [
-        { text: PROMPT + `\nKNOWN IDS: ${(knownIds || []).join(', ') || '(none yet)'}` + (note ? `\nUser note: ${note}` : '') },
+        { text: buildPhotoPrompt(getSettings()) + `\nKNOWN IDS: ${(knownIds || []).join(', ') || '(none yet)'}` + (note ? `\nUser note: ${note}` : '') },
         { inline_data: { mime_type: 'image/jpeg', data: imageB64 } }
       ]
     }],
@@ -157,7 +255,7 @@ function estimateMacros(imageB64, note, apiKey, knownIds) {
     }
   };
 
-  const m = callGemini(MODELS, payload, apiKey);
+  const m = callGemini(getSettings().photo_models, payload, apiKey);
 
   // Round to whole numbers for a cleaner sheet
   ['kcal', 'protein_g', 'carbs_g', 'fat_g'].forEach(k => m[k] = Math.round(m[k]));
@@ -213,7 +311,8 @@ function addMealRow(row) {
 
 function getLogSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  if (ss.getSpreadsheetTimeZone() !== TIME_ZONE) ss.setSpreadsheetTimeZone(TIME_ZONE);
+  const tz = getSettings().time_zone;
+  if (ss.getSpreadsheetTimeZone() !== tz) ss.setSpreadsheetTimeZone(tz);
   let sheet = ss.getSheetByName(SHEET_NAME);
   if (!sheet) {
     sheet = ss.insertSheet(SHEET_NAME);
@@ -244,7 +343,7 @@ function rebuildLog() {
     while (i < meals.length && foodDay(meals[i][0]) === day) out.push(meals[i++]);
     const end = out.length + 1;
     totalRows.push(out.length + 2);
-    out.push([new Date(out[out.length - 1][0].getTime() - DAY_START_HOUR * 3600000), 'TOTAL',
+    out.push([new Date(out[out.length - 1][0].getTime() - getSettings().day_start_hour * 3600000), 'TOTAL',
       `=SUM(C${start}:C${end})`, `=SUM(D${start}:D${end})`,
       `=SUM(E${start}:E${end})`, `=SUM(F${start}:F${end})`, '', '', '']);
   }
@@ -265,7 +364,7 @@ function rebuildLog() {
   applyTargetColors(sheet);
 }
 
-// Sums everything logged today (in the script's time zone).
+// Sums everything logged today (in the Settings time zone).
 function todayTotals() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
   const t = { today_kcal: 0, today_protein_g: 0, today_carbs_g: 0, today_fat_g: 0 };
@@ -285,27 +384,29 @@ function todayTotals() {
   return t;
 }
 
-// Run ONCE from the editor: builds a "Daily" tab with today's totals + a per-day history.
+// Builds the "Daily" tab: today's totals + a per-day history. Run by Set up / repair; safe to re-run.
 function setupDaily() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  ss.setSpreadsheetTimeZone(TIME_ZONE); // so dates match your day
+  const s = getSettings();
+  ss.setSpreadsheetTimeZone(s.time_zone); // so dates match your day
+  const dayStart = s.day_start_hour;
 
   const sheet = ss.getSheetByName('Daily') || ss.insertSheet('Daily', 0);
   sheet.clear();
 
   // Today section (updates live as rows are added to Log)
   sheet.getRange('A1:E1').setValues([['Today', 'Kcal', 'Protein (g)', 'Carbs (g)', 'Fat (g)']]);
-  sheet.getRange('A2').setFormula(`=INT(NOW() - ${DAY_START_HOUR}/24)`); // today's food day
+  sheet.getRange('A2').setFormula(`=INT(NOW() - ${dayStart}/24)`); // today's food day
   ['C', 'D', 'E', 'F'].forEach((logCol, i) => {
     sheet.getRange(2, i + 2).setFormula(
-      `=SUMIFS(${SHEET_NAME}!${logCol}:${logCol}, ${SHEET_NAME}!$A:$A, ">="&($A$2+${DAY_START_HOUR}/24), ${SHEET_NAME}!$A:$A, "<"&($A$2+1+${DAY_START_HOUR}/24), ${SHEET_NAME}!$B:$B, "<>TOTAL")`
+      `=SUMIFS(${SHEET_NAME}!${logCol}:${logCol}, ${SHEET_NAME}!$A:$A, ">="&($A$2+${dayStart}/24), ${SHEET_NAME}!$A:$A, "<"&($A$2+1+${dayStart}/24), ${SHEET_NAME}!$B:$B, "<>TOTAL")`
     );
   });
 
   // History: one row per day, newest first
   sheet.getRange('A4').setValue('History');
   sheet.getRange('A5').setFormula(
-    `=QUERY({ARRAYFORMULA(IF(${SHEET_NAME}!A2:A="",,INT(${SHEET_NAME}!A2:A - ${DAY_START_HOUR}/24))), ${SHEET_NAME}!B2:F}, ` +
+    `=QUERY({ARRAYFORMULA(IF(${SHEET_NAME}!A2:A="",,INT(${SHEET_NAME}!A2:A - ${dayStart}/24))), ${SHEET_NAME}!B2:F}, ` +
     `"select Col1, sum(Col3), sum(Col4), sum(Col5), sum(Col6) where Col1 is not null and Col2 <> 'TOTAL' ` +
     `group by Col1 order by Col1 desc ` +
     `label Col1 'Date', sum(Col3) 'Kcal', sum(Col4) 'Protein (g)', sum(Col5) 'Carbs (g)', sum(Col6) 'Fat (g)'", 0)`
@@ -329,10 +430,269 @@ function json(obj) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-// Run once from the editor to grant Sheets + external request permissions.
-function authorize() {
-  SpreadsheetApp.getActiveSpreadsheet();
-  UrlFetchApp.fetch('https://www.google.com');
+// ─────────────────────────────────────────────────────────────
+// Macro Logger menu: setup, Shortcut details, updates
+// ─────────────────────────────────────────────────────────────
+
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('Macro Logger')
+    .addItem('Set up / repair', 'setup')
+    .addItem('Show my Shortcut details', 'showShortcutDetails')
+    .addSeparator()
+    .addItem('Check for updates', 'checkForUpdates')
+    .addSeparator()
+    .addItem('Refresh suggestions', 'refreshSuggestions')
+    .addItem('Rebuild log', 'rebuildLog')
+    .addSeparator()
+    .addItem('Change Gemini key', 'changeGeminiKey')
+    .addItem('Make a new Shortcut token', 'newShortcutToken')
+    .addToUi();
+
+  // After an update, finish it the first time the Sheet is opened (adds new settings, rebuilds tabs)
+  try {
+    if (PropertiesService.getScriptProperties().getProperty('SETUP_VERSION') !== VERSION) ensureSetup();
+  } catch (err) {
+    console.warn('Post-update setup failed: ' + err); // Set up / repair will retry it
+  }
+}
+
+// Creates or repairs every tab. Never overwrites your details or settings.
+function ensureSetup() {
+  ensureSettingsTab();
+  getLogSheet();
+  setupTargets();
+  setupDaily();
+  const weight = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(WEIGHT_SHEET);
+  if (weight) fitWeightChart(weight);
+  PropertiesService.getScriptProperties().setProperty('SETUP_VERSION', VERSION);
+}
+
+// Macro Logger → Set up / repair. Safe to run any time: it only asks for what's missing or broken.
+function setup() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+
+  ensureSetup();
+
+  if (!props.getProperty('GEMINI_API_KEY')) {
+    const key = askForGeminiKey(ui);
+    if (!key) return;
+    props.setProperty('GEMINI_API_KEY', key);
+  }
+  if (!props.getProperty('SHORTCUT_TOKEN')) props.setProperty('SHORTCUT_TOKEN', makeToken());
+
+  const saved = props.getProperty('WEB_APP_URL');
+  if (!saved || checkWebAppUrl(saved)) {
+    const url = askForWebAppUrl(ui);
+    if (!url) return;
+    props.setProperty('WEB_APP_URL', url);
+  }
+
+  SpreadsheetApp.getActiveSpreadsheet().setActiveSheet(ensureSettingsTab());
+  showShortcutDetails();
+}
+
+function changeGeminiKey() {
+  const key = askForGeminiKey(SpreadsheetApp.getUi());
+  if (!key) return;
+  PropertiesService.getScriptProperties().setProperty('GEMINI_API_KEY', key);
+  SpreadsheetApp.getActiveSpreadsheet().toast('Gemini key saved', 'Macro Logger');
+}
+
+// Use this if your token was shared by accident: the old one stops working immediately.
+function newShortcutToken() {
+  const ui = SpreadsheetApp.getUi();
+  const ok = ui.alert('Make a new Shortcut token?',
+    'Your Shortcuts will stop working until you paste the new token into them.', ui.ButtonSet.OK_CANCEL);
+  if (ok !== ui.Button.OK) return;
+  PropertiesService.getScriptProperties().setProperty('SHORTCUT_TOKEN', makeToken());
+  showShortcutDetails();
+}
+
+const makeToken = () => Utilities.getUuid().replace(/-/g, '').slice(0, 16);
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+
+// For dialogs: copy('fieldId', button) copies a field's text to the clipboard
+const COPY_SCRIPT = `<script>
+  function copy(id, btn) {
+    const el = document.getElementById(id);
+    el.select();
+    const done = () => { btn.textContent = 'Copied'; };
+    (navigator.clipboard ? navigator.clipboard.writeText(el.value) : Promise.reject())
+      .then(done, () => { document.execCommand('copy'); done(); });
+  }
+</script>`;
+
+// Asks for a Gemini key until a working one is pasted (or Cancel). Returns '' on cancel.
+function askForGeminiKey(ui) {
+  for (;;) {
+    const r = ui.prompt('Paste your Gemini API key',
+      'Get one free at aistudio.google.com → Get API key → Create API key.', ui.ButtonSet.OK_CANCEL);
+    if (r.getSelectedButton() !== ui.Button.OK) return '';
+    const key = r.getResponseText().trim();
+    const res = UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1', {
+      headers: { 'x-goog-api-key': key }, muteHttpExceptions: true
+    });
+    if (res.getResponseCode() === 200) return key;
+    ui.alert("That key didn't work",
+      `Google replied with error ${res.getResponseCode()}. Check you copied the whole key, then try again.`,
+      ui.ButtonSet.OK);
+  }
+}
+
+// Asks for the /exec URL (with deploy steps) until a working one is pasted. '' on cancel.
+function askForWebAppUrl(ui) {
+  for (;;) {
+    const r = ui.prompt('Last step: turn on your web app',
+      '1. Extensions → Apps Script → Deploy → New deployment\n' +
+      '2. Click ⚙️ next to "Select type" → Web app\n' +
+      '3. Execute as: Me.  Who has access: Anyone\n' +
+      '4. Deploy, copy the Web app URL (ends in /exec) and paste it here:', ui.ButtonSet.OK_CANCEL);
+    if (r.getSelectedButton() !== ui.Button.OK) return '';
+    const url = r.getResponseText().trim();
+    const problem = checkWebAppUrl(url);
+    if (!problem) return url;
+    ui.alert("That URL didn't work", problem, ui.ButtonSet.OK);
+  }
+}
+
+// '' if the URL is this project's working web app, else what's wrong in plain words.
+function checkWebAppUrl(url) {
+  if (!/^https:\/\/script\.google\.com\/.+\/exec$/.test(url)) {
+    return 'It should start with https://script.google.com/ and end with /exec.';
+  }
+  const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
+  let body = {};
+  try { body = JSON.parse(res.getContentText()); } catch (err) { /* sign-in page or error page */ }
+  if (body.status !== 'ok') {
+    return 'Google showed a sign-in or error page instead. In Deploy → Manage deployments, check that ' +
+           '"Who has access" is Anyone (not "Anyone with Google account").';
+  }
+  return '';
+}
+
+// Macro Logger → Show my Shortcut details: the URL + token to paste into the iPhone Shortcuts.
+function showShortcutDetails() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const url = props.getProperty('WEB_APP_URL');
+  const token = props.getProperty('SHORTCUT_TOKEN');
+  if (!url || !token) {
+    ui.alert('Not set up yet', 'Click Macro Logger → Set up / repair first.', ui.ButtonSet.OK);
+    return;
+  }
+
+  const links = SHORTCUT_LINKS.map(([name, link]) => link
+    ? `<a href="${esc(link)}" target="_blank">${esc(name)}</a>`
+    : `${esc(name)} (link in the README)`).join(' · ');
+  const field = (id, label, value) => `
+    <label for="${id}">${label}</label>
+    <div class="row"><input id="${id}" readonly value="${esc(value)}">
+    <button onclick="copy('${id}', this)">Copy</button></div>`;
+
+  const html = `
+    <style>
+      body { font-family: Arial, sans-serif; font-size: 14px; color: #202124; }
+      label { display: block; font-weight: bold; margin-top: 14px; }
+      .row { display: flex; gap: 8px; margin-top: 4px; }
+      input { flex: 1; padding: 6px; font-family: monospace; font-size: 13px; }
+      button { padding: 6px 14px; }
+      .warn { margin-top: 18px; color: #b3261e; }
+    </style>
+    <div>On your iPhone, open each Shortcut link and tap <b>Add Shortcut</b>. When it asks, paste these two:</div>
+    ${field('url', 'Web app URL', url)}
+    ${field('token', 'Token', token)}
+    <p>Shortcuts: ${links}</p>
+    <p>To get these onto your phone, send them to yourself in Notes or email, not in a group chat.</p>
+    <p class="warn">Keep these private: anyone with both can add entries to your Sheet.</p>
+    ${COPY_SCRIPT}`;
+  ui.showModalDialog(HtmlService.createHtmlOutput(html).setWidth(560).setHeight(380), 'Your Shortcut details');
+}
+
+// ── Update check ────────────────────────────────────────────
+
+// Where updates come from. UPDATE_REPO / UPDATE_REF (Script Properties) are only for testing.
+function updateSource() {
+  const props = PropertiesService.getScriptProperties();
+  return { repo: props.getProperty('UPDATE_REPO') || REPO, ref: props.getProperty('UPDATE_REF') || 'main' };
+}
+
+// The newest released version number, e.g. "1.1.0". Cached for 6 hours unless fresh = true.
+function latestVersion(fresh) {
+  const cache = CacheService.getScriptCache();
+  if (!fresh) {
+    const cached = cache.get('latest_version');
+    if (cached) return cached;
+  }
+  const { repo, ref } = updateSource();
+  const res = UrlFetchApp.fetch(`https://raw.githubusercontent.com/${repo}/${ref}/VERSION`, { muteHttpExceptions: true });
+  if (res.getResponseCode() !== 200) throw new Error(`Couldn't check for updates (GitHub ${res.getResponseCode()})`);
+  const v = res.getContentText().trim();
+  cache.put('latest_version', v, 21600);
+  return v;
+}
+
+// true if version a is newer than version b ("1.10.0" > "1.9.2")
+function isNewer(a, b) {
+  const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  }
+  return false;
+}
+
+// One line for the Shortcut notification and the Daily tab; '' when up to date. Never throws.
+function updateNotice() {
+  try {
+    const v = latestVersion(false);
+    return isNewer(v, VERSION) ? `Update available: v${v}. Open your Sheet → Macro Logger → Check for updates` : '';
+  } catch (err) {
+    return '';
+  }
+}
+
+// ── Guided update ───────────────────────────────────────────
+// The script never changes its own code. It shows the new release and the steps to paste
+// it in, so every update is a deliberate action by the owner of the copy.
+
+// Macro Logger → Check for updates
+function checkForUpdates() {
+  const ui = SpreadsheetApp.getUi();
+  const latest = latestVersion(true);
+  if (!isNewer(latest, VERSION)) {
+    ui.alert(`You're up to date (v${VERSION}).`);
+    return;
+  }
+
+  const { repo } = updateSource();
+  const res = UrlFetchApp.fetch(`https://raw.githubusercontent.com/${repo}/v${latest}/src/Code.js`, { muteHttpExceptions: true });
+  const code = res.getContentText();
+  if (res.getResponseCode() !== 200 || !code.includes(`const VERSION = '${latest}'`)) {
+    ui.alert('Update not ready', `Couldn't download v${latest} yet. Try again later.`, ui.ButtonSet.OK);
+    return;
+  }
+
+  const html = `
+    <style>
+      body { font-family: Arial, sans-serif; font-size: 14px; color: #202124; line-height: 1.45; }
+      textarea { width: 100%; height: 90px; font-family: monospace; font-size: 11px; }
+      button { padding: 6px 14px; margin: 6px 0; }
+      li { margin-bottom: 6px; }
+    </style>
+    <div>You have v${esc(VERSION)}. <a href="https://github.com/${esc(repo)}/blob/main/CHANGELOG.md" target="_blank">What's new in v${esc(latest)}</a></div>
+    <ol>
+      <li><button onclick="copy('code', this)">Copy the new code</button></li>
+      <li><b>Extensions → Apps Script</b>. In <code>Code.gs</code>, select everything (Ctrl/Cmd + A), paste, and click 💾 <b>Save</b>.</li>
+      <li><b>Deploy → Manage deployments → ✏️ Edit → Version: New version → Deploy.</b>
+          Skip this and your Shortcuts keep running the old version.</li>
+      <li>Reload this Sheet.</li>
+    </ol>
+    <div>Your meals, Settings, Targets, web app URL and token all stay the same. If the release notes
+      say the <code>appsscript.json</code> file changed too, replace it the same way.</div>
+    <textarea id="code" readonly>${esc(code)}</textarea>
+    ${COPY_SCRIPT}`;
+  ui.showModalDialog(HtmlService.createHtmlOutput(html).setWidth(620).setHeight(440), `Update to v${latest}`);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -348,7 +708,7 @@ const ACTIVITY_LEVELS = [
 ];
 const GOALS = [['Weight Loss', -500], ['Maintenance', 0], ['Weight Gain', 500]];
 
-// Run ONCE from the editor: builds the "Targets" tab, then recolours the Log.
+// Builds the "Targets" tab, then recolours the Log. Run by Set up / repair; keeps your details (B2:B7).
 function setupTargets() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName('Targets');
@@ -439,7 +799,6 @@ function applyTargetColors(sheet) {
 // ─────────────────────────────────────────────────────────────
 
 const WEIGHT_SHEET = 'Weight';
-const SYNC_TARGET_WEIGHT = true; // keeps Targets!B4 = latest weight, so calorie targets follow you
 
 function getWeightSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -465,6 +824,21 @@ function getWeightSheet() {
   return sheet;
 }
 
+// Zooms the weight chart to your own range (e.g. 68–74 kg) instead of starting at 0 kg,
+// so small changes are visible. Runs after every weight log.
+function fitWeightChart(sheet) {
+  const chart = sheet.getCharts()[0];
+  if (!chart || sheet.getLastRow() < 2) return;
+  const kgs = sheet.getRange(2, 2, sheet.getLastRow() - 1, 2).getValues().flat()
+    .map(Number).filter(n => n > 0);
+  if (!kgs.length) return;
+  const min = Math.floor(Math.min(...kgs) - 1);
+  const max = Math.ceil(Math.max(...kgs) + 1);
+  sheet.updateChart(chart.modify()
+    .setOption('vAxes', { 0: { viewWindow: { min, max } } })
+    .build());
+}
+
 // One row per day; logging again on the same day overwrites that day's entry.
 function logWeight(raw) {
   const kg = Math.round(parseFloat(String(raw).replace(',', '.')) * 10) / 10;
@@ -475,7 +849,7 @@ function logWeight(raw) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = getWeightSheet();
-    const dayKey = d => Utilities.formatDate(d, TIME_ZONE, 'yyyy-MM-dd');
+    const dayKey = d => Utilities.formatDate(d, getSettings().time_zone, 'yyyy-MM-dd');
 
     const last = sheet.getLastRow();
     let row = last + 1;
@@ -491,12 +865,13 @@ function logWeight(raw) {
     sheet.getRange(row, 1).setNumberFormat('ddd, d mmm yyyy');
     sheet.getRange(row, 2, 1, 3).setNumberFormat('0.0');
 
-    if (SYNC_TARGET_WEIGHT) {
+    if (getSettings().sync_weight_to_targets) {
       const targets = ss.getSheetByName('Targets');
       if (targets) targets.getRange('B4').setValue(kg);
     }
 
     SpreadsheetApp.flush();
+    fitWeightChart(sheet);
     return {
       status: 'ok',
       weight_kg: kg,
@@ -657,7 +1032,6 @@ function quickLog(food, servings) {
 // Next-meal suggestions
 // ─────────────────────────────────────────────────────────────
 
-const SUGGEST_MODELS = ['gemini-3.5-flash-lite', 'gemini-3.6-flash']; // Flash-Lite first: cheap, big quota
 
 // Works out what's left for today, asks Gemini for 3 ideas based on foods you actually eat,
 // writes them to the Daily tab, and returns a one-line summary for the notification.
@@ -675,14 +1049,15 @@ function suggestNextMeal(apiKey) {
     carbs_g: Math.round(carbsT - t.today_carbs_g),
     fat_g: Math.round(fatT - t.today_fat_g)
   };
-  const time = Utilities.formatDate(new Date(), TIME_ZONE, 'h:mm a');
+  const settings = getSettings();
+  const time = Utilities.formatDate(new Date(), settings.time_zone, 'h:mm a');
 
   if (left.kcal <= 50 && left.protein_g <= 5) {
     writeSuggestions(left, [], time);
     return goal === 'Weight Loss' ? 'Calorie budget used up for today' : 'Targets hit for today 🎉';
   }
 
-  const prompt = `You suggest what a university student in Malaysia should eat next.
+  const prompt = `You suggest what ${settings.about_me} should eat next.
 
 Goal: ${goal}. Local time: ${time}.
 Remaining for today: ${left.kcal} kcal, ${left.protein_g} g protein, ${left.carbs_g} g carbs, ${left.fat_g} g fat.
@@ -693,7 +1068,7 @@ ${usualFoods().join('\n') || '(no history yet)'}
 
 Suggest exactly 3 options, best first:
 - Prefer foods from the list above (combinations are fine, e.g. a meal plus a drink).
-  You may add common Malaysian hawker/kopitiam/convenience-store options if the list doesn't fit.
+  You may add common everyday options (${settings.usual_food}, convenience-store food) if the list doesn't fit.
 - Prioritise whichever macro is furthest behind, usually protein.
 - ${goal === 'Weight Loss'
     ? 'Stay within the remaining calories.'
@@ -702,7 +1077,7 @@ Suggest exactly 3 options, best first:
 - If very little is left, suggest a small snack.
 Keep "meal" under 8 words and "reason" under 12 words.`;
 
-  const r = callGemini(SUGGEST_MODELS, {
+  const r = callGemini(settings.suggest_models, {
     contents: [{ parts: [{ text: prompt }] }],
     generationConfig: {
       responseMimeType: 'application/json',
@@ -775,15 +1150,18 @@ function writeSuggestions(left, suggestions, time) {
     ]));
   }
   daily.getRange('G7').setValue(`Updated ${time}`).setFontColor('#888888');
+  const notice = updateNotice();
+  daily.getRange('G8').setValue(notice).setFontColor('#b3261e').setFontWeight(notice ? 'bold' : 'normal');
   daily.setColumnWidth(7, 380);
   daily.setColumnWidth(8, 280);
 }
 
-// Run from the editor to refresh the Daily tab suggestions without logging a meal.
+// Macro Logger → Refresh suggestions: updates the Daily tab suggestions without logging a meal.
 function refreshSuggestions() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  if (!ss.getSheetByName('Targets')) throw new Error('No Targets tab — run setupTargets first');
-  if (!ss.getSheetByName('Daily')) throw new Error('No Daily tab — run setupDaily first');
+  if (!ss.getSheetByName('Targets') || !ss.getSheetByName('Daily')) {
+    throw new Error('Missing the Targets or Daily tab: click Macro Logger → Set up / repair first');
+  }
   const s = suggestNextMeal(PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY'));
-  console.log(s);
+  ss.toast(s || 'Suggestions refreshed', 'Macro Logger');
 }

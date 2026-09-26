@@ -24,8 +24,8 @@ The video follows the same numbered steps as below. Use the chapters to jump to 
 You'll need:
 - An **iPhone** with the Shortcuts app (it comes pre-installed)
 - A **Google account**
-- A **laptop or computer**. Steps 1–7 are much easier on a big screen.
-- About **20–30 minutes**
+- A **laptop or computer**. Steps 1–5 are much easier on a big screen.
+- About **20 minutes**
 
 **Cost:** free. Google's free Gemini allowance is plenty for logging your meals every day.
 
@@ -40,16 +40,17 @@ You'll need:
 1. Open this link while signed in to Google: **[Make a copy of Macro Logger](TODO_TEMPLATE_URL)**
 2. Click **Make a copy**.
 
-The copy is yours. It already has the code and the tabs (`Log`, `Targets`, `Daily`) set up.
+The copy is yours, and the code comes with it. After a few seconds a **Macro Logger** menu appears at the top of the Sheet, next to Help. If it doesn't, reload the page.
 
 <details>
 <summary>Link not working? Install it by hand instead</summary>
 
 1. Go to [sheets.new](https://sheets.new) to create a blank Google Sheet.
 2. In the Sheet's menu, click **Extensions → Apps Script**.
-3. Delete everything in the editor, then paste in the whole of [macro-logger.gs](macro-logger.gs). Click 💾 **Save**.
-4. At the top of the editor, pick `setupTargets` from the function dropdown and click **▶ Run**. The first time, it asks for permission: follow Step 5 below, then come back.
-5. Pick `setupDaily` and click **▶ Run**.
+3. Delete everything in the `Code.gs` file, paste in the whole of [src/Code.js](src/Code.js), and click 💾 **Save**.
+4. Click ⚙️ **Project Settings** and tick **Show "appsscript.json" manifest file in editor**.
+5. Go back to the editor (**<>** on the left), open `appsscript.json`, replace everything in it with [src/appsscript.json](src/appsscript.json), and click 💾 **Save**.
+6. Close the Apps Script tab, then reload the Sheet. The **Macro Logger** menu appears.
 
 > ⚠️ Open Apps Script **from inside the Sheet** (Extensions → Apps Script). A project created on script.google.com won't work.
 
@@ -59,91 +60,62 @@ The copy is yours. It already has the code and the tabs (`Log`, `Targets`, `Dail
 
 1. Go to [aistudio.google.com](https://aistudio.google.com) and sign in.
 2. Click **Get API key → Create API key**.
-3. Copy the key and keep the tab open. You need it in the next step.
+3. Copy the key. You'll paste it in Step 3.
 
 > Treat this key like a password. Don't post it anywhere.
 
-### Step 3: Add your key and make up a password
+### Step 3: Run the setup
 
-1. In your copied Sheet, click **Extensions → Apps Script**.
-2. On the left, click ⚙️ **Project Settings**.
-3. Under **Time zone**, choose your own time zone.
-4. Scroll to **Script Properties** → **Add script property**, and add these two:
-
-| Property | Value |
-|---|---|
-| `GEMINI_API_KEY` | the key from Step 2 |
-| `SHORTCUT_TOKEN` | a password you make up, with no spaces (e.g. `purple-tiger-2931`) |
-
-5. Click **Save script properties**.
-
-The `SHORTCUT_TOKEN` is what stops other people from writing to your Sheet. You'll type it into the Shortcut in Step 8, so write it down.
-
-### Step 4: Change your time zone and hand size (skip if you're in Malaysia)
-
-In the Apps Script editor, click `Code.gs` (or whatever the code file is called) on the left. Near the top, change these lines:
-
-```js
-const TIME_ZONE = 'Asia/Kuala_Lumpur';   // your time zone, e.g. 'Asia/Singapore', 'Europe/London'
-const HAND_LENGTH_CM = 16.5;             // base of your palm to the tip of your middle finger
-const HAND_WIDTH_CM = 8.4;               // across your palm, side to side
-```
-
-- **Time zone:** use a name from [this list](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) (the "TZ identifier" column). Without it, meals land on the wrong day.
-- **Hand size:** measure your own hand with a ruler. The AI uses your hand in the photo to judge portions, so this makes estimates more accurate for everyone, including people in Malaysia.
-
-Click 💾 **Save**.
-
-> The AI is currently tuned for Malaysian food. It still works for other food, but the suggestions will lean Malaysian.
-
-### Step 5: Give the script permission
-
-1. At the top of the editor, pick `authorize` from the function dropdown and click **▶ Run**.
-2. Click **Review permissions** and choose your Google account.
+1. In your Sheet, click **Macro Logger → Set up / repair**.
+2. Google asks for permission. Choose your account.
 3. You'll see **"Google hasn't verified this app."** This is expected, because you're the developer of your own copy. Click **Advanced → Go to (project name) (unsafe) → Allow**.
+4. Click **Macro Logger → Set up / repair** again. Setup doesn't run on the same click that asks for permission.
+5. Paste your Gemini key from Step 2 when it asks.
 
-### Step 6: Turn it on (deploy)
+Setup then asks for your **Web app URL**. Leave that box open and do Step 4.
 
-1. In the editor, click **Deploy → New deployment**.
-2. Click the ⚙️ next to "Select type" → **Web app**.
-3. Set:
+### Step 4: Turn on your web app (deploy)
+
+1. In your Sheet, click **Extensions → Apps Script**. The code editor opens in a new tab.
+2. Click **Deploy → New deployment**.
+3. Click the ⚙️ next to "Select type" → **Web app**.
+4. Set:
    - **Execute as:** Me
    - **Who has access:** Anyone
-4. Click **Deploy** and copy the **Web app URL**. It ends in `/exec`.
+5. Click **Deploy** and copy the **Web app URL**. It ends in `/exec`.
+6. Go back to the Sheet tab and paste the URL into the setup box.
 
-**Check it works:** paste the URL into a browser. You should see a line containing `"status":"ok"`.
+> "Anyone" is safe here: without your token, nobody can add anything to your Sheet.
 
-> "Anyone" is safe here: without your `SHORTCUT_TOKEN`, nobody can add anything to your Sheet.
+Setup checks that the URL works. Then a window called **Your Shortcut details** shows your **Web app URL** and **Token**. You'll need both in Step 6. You can open this window again any time from **Macro Logger → Show my Shortcut details**.
 
-### Step 7: Fill in your details
+### Step 5: Fill in your details
 
-In your Sheet, open the **Targets** tab and fill in the yellow cells:
+**Settings tab:** change the yellow cells that don't fit you. Each row explains itself.
 
-| Cell | What to enter |
+| Setting | Why it matters |
 |---|---|
-| B2 | Sex |
-| B3 | Age |
-| B4 | Weight (kg) |
-| B5 | Height (cm) |
-| B6 | Activity level (dropdown) |
-| B7 | Goal: Weight Loss, Maintenance or Weight Gain (dropdown) |
+| `time_zone` | So meals land on the right day. Change it if you're not in Malaysia. |
+| `hand_length_cm`, `hand_width_cm` | **Measure your hand.** The AI uses your hand in the photo to judge portion size. |
+| `usual_food` | The kind of food you eat, e.g. `Japanese home cooking` |
+| `about_me` | A few words for meal suggestions, e.g. `a university student in Malaysia` |
 
-Your daily calorie, protein, carb and fat targets appear below these cells.
+If you change `time_zone` or `day_start_hour`, click **Macro Logger → Set up / repair** once afterwards.
 
-### Step 8: Add the Shortcuts to your iPhone
+**Targets tab:** fill in the yellow cells (sex, age, weight, height, activity level, goal). Your daily calorie, protein, carb and fat targets appear below them.
+
+### Step 6: Add the Shortcuts to your iPhone
 
 Open these links **on your iPhone** and tap **Add Shortcut**:
 
 - **[Log Meal](TODO_LOG_MEAL_URL)**: take a photo and log it
 - **[Log Weight](TODO_LOG_WEIGHT_URL)**: type in your weight
 
-Each one asks you two questions when you add it:
-1. **Web app URL:** paste the `/exec` URL from Step 6.
-2. **Token:** type the `SHORTCUT_TOKEN` from Step 3, exactly the same.
+Each one asks you two questions when you add it. Paste the **Web app URL** and the **Token** from Step 4.
 
-> Tip: to get the URL onto your phone, email it to yourself or use Notes. Don't paste it into a group chat.
+> Tip: to get them onto your phone, copy them into Notes or email them to yourself. Don't paste them into a group chat.
 
-### Step 9: Try it
+### Step 7: Try it
 
 1. Run **Log Meal** and take a photo of a real meal, with your hand in the shot.
 2. The first time, tap **Allow** for the camera, then **Always Allow** when it asks to connect to `script.google.com`.
@@ -157,27 +129,30 @@ Each one asks you two questions when you add it:
 
 ## Keep your link and token private
 
-Anyone with **both** your Web app URL and your `SHORTCUT_TOKEN` can add entries to your Sheet. So:
+Anyone with **both** your Web app URL and your Token can add entries to your Sheet. So:
 
 - **Don't share your Shortcuts.** Your copies contain your URL and token. Send friends the links in this README instead.
 - **Blur the URL and token** in any screenshot or screen recording.
 
-**If your token gets out**, change `SHORTCUT_TOKEN` in Script Properties (Step 3) and in both Shortcuts. The old token stops working straight away. If your Gemini key gets out, delete it in AI Studio and make a new one.
+**If your token gets out:** click **Macro Logger → Make a new Shortcut token** and paste the new token into both Shortcuts. The old one stops working straight away.
+**If your Gemini key gets out:** delete it in AI Studio, make a new one, and click **Macro Logger → Change Gemini key**.
 
 ---
 
-## Updating to a new version
+## Updating
 
-Your copy doesn't update on its own. When a new version is released:
+When a new version is out, your meal notification and the **Daily** tab say **"Update available"**. To install it, click **Macro Logger → Check for updates**. A window shows the new code and walks you through it:
 
-1. Open your Sheet → **Extensions → Apps Script**.
-2. Select all the code, delete it, paste in the new [macro-logger.gs](macro-logger.gs), and click 💾 **Save**.
-3. **Redo your Step 4 changes** (time zone, hand size) if you made any. Pasting the new code replaces them.
-4. **Deploy → Manage deployments → ✏️ (Edit) → Version: New version → Deploy.**
+1. Click **Copy the new code**.
+2. Open **Extensions → Apps Script**. In `Code.gs`, select everything, paste, and click 💾 **Save**.
+3. Click **Deploy → Manage deployments → ✏️ Edit → Version: New version → Deploy.**
+4. Reload the Sheet.
 
-> ⚠️ **Don't skip step 4.** If you only save, your Shortcuts keep running the old code. Your URL stays the same, so the Shortcuts don't need changing.
+> ⚠️ **Don't skip step 3.** If you only save, your Shortcuts keep running the old version.
 
-If the release notes mention a function to run (e.g. `setupTargets`), run it once. These functions keep your existing details.
+Your meals, settings, web app URL and token stay the same, so your Shortcuts keep working. See [what's new](CHANGELOG.md).
+
+> Macro Logger never changes its own code. Updates only happen when you paste them in, and you can read every release here first.
 
 ---
 
@@ -185,15 +160,17 @@ If the release notes mention a function to run (e.g. `setupTargets`), run it onc
 
 | What you see | What to do |
 |---|---|
-| *"Couldn't convert from Rich Text to Dictionary"* | The script sent back an error page. Check the rows below, and make sure you deployed after your last change. |
-| A Google sign-in page | Step 6: **Who has access** must be **Anyone**, not "Anyone with Google account". |
-| *"Sorry, unable to open the file at present"* | The script wasn't created from inside the Sheet. Use Step 1 again. |
-| `unauthorized` | The token in the Shortcut doesn't match `SHORTCUT_TOKEN` exactly (check spaces and capitals). |
+| No **Macro Logger** menu | Reload the Sheet and wait a few seconds. |
+| Setup says the URL didn't work | In Apps Script, **Deploy → Manage deployments**: check **Who has access** is **Anyone**, then paste the `/exec` URL again. |
+| *"Couldn't convert from Rich Text to Dictionary"* | The script sent back an error page. Click **Macro Logger → Set up / repair** to check your URL, then try again. |
+| I pasted new code but nothing's different | Deploy a **New version** (see Updating, step 3). |
+| `unauthorized` | The token in the Shortcut doesn't match. Open **Macro Logger → Show my Shortcut details** and paste it again. |
 | `Gemini 429` | You've used today's free Gemini allowance. It resets at midnight US Pacific time. |
 | `Gemini 503` | Gemini is busy. Try again in a minute. |
 | *"The request timed out"* | Try again. Gemini is sometimes slow. |
-| I changed the code but nothing's different | Deploy a **New version** (see Updating, step 4). |
-| Blank notification | Re-add the Shortcut from the link in Step 8. |
+| Meals land on the wrong day | Check `time_zone` on the Settings tab, then click **Set up / repair**. |
+| Google asks for permission again after an update | Expected when a new version needs it. Approve it the same way as Step 3. |
+| Blank notification | Re-add the Shortcut from the link in Step 6. |
 
 ---
 
